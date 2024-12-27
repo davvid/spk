@@ -1,3 +1,6 @@
+ZLIB := $(shell test -d /usr/share/doc/zlib1g && echo zlib1g || echo zlib)
+LIBC := $(shell test -d /usr/share/doc/libc6 && echo libc6 || echo glibc)
+
 .PHONY: packages
 packages: \
 	bootstrap \
@@ -16,7 +19,7 @@ bootstrap: \
 	stdfs/stdfs.spk \
 	bootstrap/automake.spk \
 	bootstrap/gcc.spk \
-	bootstrap/glibc.spk
+	bootstrap/$(LIBC).spk
 bootstrap.full: bootstrap \
 	bootstrap/autoconf.spk \
 	bootstrap/autoconf-archive.spk \
@@ -34,7 +37,7 @@ bootstrap.full: bootstrap \
 	bootstrap/help2man.spk \
 	bootstrap/gettext.spk \
 	bootstrap/zip.spk \
-	bootstrap/zlib.spk
+	bootstrap/$(ZLIB).spk
 
 .PHONY: gnu
 gnu: bootstrap.full \
