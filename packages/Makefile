@@ -89,7 +89,7 @@ import:
 
 %.spk : %.spk.yaml
 	spk info -r local $<@sources > /dev/null 2>&1 || spk make-source -v $<
-	spk mkb -r origin -v $<
+	spk mkb -r origin -vv $<
 	spk export $< $@
 
 .PRECIOUS: bootstrap/*.spk.yaml
