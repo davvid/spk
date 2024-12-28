@@ -195,6 +195,27 @@ make setcap bindir=$PWD/target/debug
 tests/integration/run_all.sh
 ```
 
+### Debian / Ubuntu
+
+These packages must be installed in order to use overlay filesystems with spfs on Debian / Ubuntu.
+
+```sh
+sudo apt-get install overlayroot
+```
+
+Building spk requires the following packages:
+
+```sh
+sudo apt-get install -y \
+    cmake \
+    fuse3 \
+    libcap2-bin \
+    libfuse3-dev \
+    rsync \
+    protobuf-compiler \
+    tcsh
+```
+
 ### Windows
 
 To build and run on Windows, you need a couple of dependencies that are easiest to install via Chocolatey.
