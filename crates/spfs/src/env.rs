@@ -16,6 +16,7 @@ use linux_syscall::{
     SYS_fsopen,
     SYS_mount_setattr,
     SYS_move_mount,
+    SYS_open_tree,
 };
 
 use super::runtime;
@@ -36,6 +37,8 @@ const FSMOUNT_CLOEXEC: u32 = 0x00000001;
 const MOUNT_ATTR_RDONLY: u32 = 0x00000001;
 const MOUNT_ATTR_SIZE_VER0: u32 = 32;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
+const OPEN_TREE_CLONE: u32 = 1;
+const OPEN_TREE_CLOEXEC: u32 = 0o2000000;
 
 // Linux fcntl constants from /usr/include/fcntl.h.
 const AT_EMPTY_PATH: u32 = 0x1000;
@@ -467,87 +470,6 @@ where
         rt.ensure_required_directories().await
     }
 
-    async fn mount_live_layers(&self, rt: &runtime::Runtime) -> Result<()> {
-        // Mounts the bind mounts from the any live layers in the runtime the top of paths
-        // inside /spfs
-        //
-        // It requires the mount destinations to exist under
-        // /spfs/. If they do not, the mount commands will error. The
-        // mount destinations are either provided by one of the layers
-        // in the runtime, or by an earlier call to
-        // ensure_extra_bind_mount_locations_exist() made in
-        // initialize_runtime()
-        let live_layers = rt.live_layers();
-        if !live_layers.is_empty() {
-            tracing::debug!("mounting the extra bind mounts over the {SPFS_DIR} filesystem ...");
-            let mount = super::resolve::which("mount").unwrap_or_else(|| "/usr/bin/mount".into());
-
-            for layer in live_layers {
-                let injection_mounts = layer.bind_mounts();
-
-                for extra_mount in injection_mounts {
-                    let dest = if extra_mount.dest.starts_with(SPFS_DIR_PREFIX) {
-                        PathBuf::from(extra_mount.dest.clone())
-                    } else {
-                        PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone())
-                    };
-
-                    let mut cmd = tokio::process::Command::new(mount.clone());
-                    cmd.arg("--bind");
-                    cmd.arg(extra_mount.src.to_string_lossy().into_owned());
-                    cmd.arg(dest);
-                    tracing::debug!("About to run: {cmd:?}");
-
-                    match cmd.status().await {
-                        Err(err) => {
-                            return Err(Error::process_spawn_error("mount".to_owned(), err, None))
-                        }
-                        Ok(status) => match status.code() {
-                            Some(0) => (),
-                            _ => {
-                             return Err(format!(
-                                 "Failed to inject bind mount into the {SPFS_DIR} filesystem using: {cmd:?}"
-                             ).into())
-                            }
-                        },
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn unmount_live_layers(&self, rt: &runtime::Runtime) -> Result<()> {
-        // Unmount the bind mounted items from the live layers
-        let live_layers = rt.live_layers();
-        if !live_layers.is_empty() {
-            tracing::debug!("unmounting the extra bind mounts from the {SPFS_DIR} filesystem ...");
-            let umount =
-                super::resolve::which("umount").unwrap_or_else(|| "/usr/bin/umount".into());
-
-            for layer in live_layers {
-                let injection_mounts = layer.bind_mounts();
-
-                for extra_mount in injection_mounts {
-                    let mut cmd = tokio::process::Command::new(umount.clone());
-                    cmd.arg(PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone()));
-                    tracing::debug!("About to run: {cmd:?}");
-
-                    match cmd.status().await {
-                        Err(err) => {
-                            return Err(Error::process_spawn_error("umount".to_owned(), err, None))
-                        }
-                        Ok(status) => match status.code() {
-                            Some(0) => (),
-                            _ => return Err(format!("Failed to unmount a bind mount injected into the {SPFS_DIR} filesystem using: {cmd:?}").into()),
-                        },
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Mounts an overlayfs built up from the given list of rendered
     /// layered directories (layer_dirs).
     ///
@@ -569,7 +491,7 @@ where
         } else {
             mount_overlayfs_command(rt, layer_dirs).await?;
         }
-        self.mount_live_layers(rt).await
+        mount_live_layers(rt).await
     }
 
     #[cfg(feature = "fuse-backend")]
@@ -580,7 +502,7 @@ where
     #[cfg(feature = "fuse-backend")]
     pub(crate) async fn mount_env_fuse(&self, rt: &runtime::Runtime) -> Result<()> {
         self.mount_fuse_onto(rt, SPFS_DIR).await?;
-        self.mount_live_layers(rt).await
+        mount_live_layers(rt).await
     }
 
     #[cfg(feature = "fuse-backend")]
@@ -900,7 +822,7 @@ where
                 // Unmount any extra paths mounted in the depths of
                 // the fuse-only backend before fuse itself is
                 // unmounted to avoid issue with lazy unmounting.
-                self.unmount_live_layers(rt).await?;
+                unmount_live_layers(rt).await?;
                 std::path::Path::new(SPFS_DIR)
             }
             runtime::MountBackend::OverlayFsWithRenders | runtime::MountBackend::WinFsp => {
@@ -1229,7 +1151,6 @@ pub fn option_to_string(option: &fuser::MountOption) -> String {
     }
 }
 
-
 /// Mount overlayfs layers using the mount command.
 async fn mount_overlayfs_command<P: AsRef<Path>>(
     rt: &runtime::Runtime,
@@ -1533,6 +1454,198 @@ fn mount_overlayfs_syscalls<P: AsRef<Path>>(rt: &runtime::Runtime, layer_dirs: &
         .into());
     }
     nix::unistd::close(mount_fd as std::ffi::c_int)?;
+
+    Ok(())
+}
+
+/// Mount bind mounts from live layers in the runtime over the top of paths inside /spfs.
+async fn mount_live_layers(rt: &runtime::Runtime) -> Result<()> {
+    // This requires the mount destinations to exist under
+    // /spfs/. If they do not, the mount commands will error. The
+    // mount destinations are either provided by one of the layers
+    // in the runtime, or by an earlier call to
+    // ensure_extra_bind_mount_locations_exist() made in
+    // initialize_runtime()
+    let live_layers = rt.live_layers();
+    if !live_layers.is_empty() {
+        let spfs_config = crate::Config::current()?;
+        if spfs_config.filesystem.use_mount_syscalls {
+            mount_live_layers_syscalls(live_layers)?;
+        } else {
+            mount_live_layers_command(live_layers).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Bind-mount live layers using the "mount" command.
+async fn mount_live_layers_command(live_layers: &Vec<runtime::LiveLayer>) -> Result<()> {
+    tracing::debug!(
+        "mounting extra bind mounts over the {SPFS_DIR} filesystem using the mount command"
+    );
+    let mount = super::resolve::which("mount").unwrap_or_else(|| "/usr/bin/mount".into());
+
+    for layer in live_layers {
+        let injection_mounts = layer.bind_mounts();
+
+        for extra_mount in injection_mounts {
+            let dest = if extra_mount.dest.starts_with(SPFS_DIR_PREFIX) {
+                PathBuf::from(extra_mount.dest.clone())
+            } else {
+                PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone())
+            };
+
+            let mut cmd = tokio::process::Command::new(mount.clone());
+            cmd.arg("--bind");
+            cmd.arg(extra_mount.src.to_string_lossy().into_owned());
+            cmd.arg(dest);
+            tracing::debug!("About to run: {cmd:?}");
+
+            match cmd.status().await {
+                Err(err) => return Err(Error::process_spawn_error("mount".to_owned(), err, None)),
+                Ok(status) => match status.code() {
+                    Some(0) => (),
+                    _ => {
+                        return Err(format!(
+                        "Failed to inject bind mount into the {SPFS_DIR} filesystem using: {cmd:?}"
+                    )
+                        .into())
+                    }
+                },
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Bind-mount live layers using mount syscalls.
+fn mount_live_layers_syscalls(live_layers: &Vec<runtime::LiveLayer>) -> Result<()> {
+    tracing::debug!(
+        "mounting extra bind mounts over the {SPFS_DIR} filesystem using mount syscalls"
+    );
+
+    for layer in live_layers {
+        let injection_mounts = layer.bind_mounts();
+
+        for extra_mount in injection_mounts {
+            let Ok(src) = extra_mount.src.canonicalize() else {
+                return Err(format!("unable to canonicalize {:?}", extra_mount.src).into());
+            };
+            let dest = if extra_mount.dest.starts_with(SPFS_DIR_PREFIX) {
+                PathBuf::from(extra_mount.dest.clone())
+            } else {
+                PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone())
+            };
+            let src_path = CString::new(src.to_string_lossy().as_ref())
+                .expect("allocate CString for live layer bind source");
+            let dest_path = CString::new(dest.to_string_lossy().as_ref())
+                .expect("allocate CString for live layer destination");
+
+            // mount_fd = open_tree(AT_FDCWD, "<src>", OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC)
+            let mount_fd = unsafe {
+                syscall!(
+                    SYS_open_tree,
+                    AT_FDCWD,
+                    src_path.as_ptr(),
+                    OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC
+                )
+            }
+            .as_u64_unchecked() as i32;
+            if mount_fd < 0 {
+                return Err(format!("mount_live_layers_syscalls::SYS_open_tree(AT_FDCWD, {:?}, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC) error: {}",
+                    src_path, mount_fd).into());
+            }
+
+            // move_mount(mount_fd, "", AT_FDCWD, "<dest>", MOVE_MOUNT_F_EMPTY_PATH)
+            let rc = unsafe {
+                syscall!(
+                    SYS_move_mount,
+                    mount_fd,
+                    c"".as_ptr(),
+                    AT_FDCWD,
+                    dest_path.as_ptr(),
+                    MOVE_MOUNT_F_EMPTY_PATH
+                )
+            }
+            .as_u64_unchecked() as i32;
+            if rc != 0 {
+                return Err(format!(
+                    "mount_overlayfs_syscalls::SYS_move_mount({}, \"\", AT_FDCWD, {:?}, MOVE_MOUNT_F_EMPTY_PATH) error: {}",
+                    mount_fd, dest_path, rc
+                )
+                .into());
+            }
+            nix::unistd::close(mount_fd as std::ffi::c_int)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Unmount the bind mounted items from the live layers
+async fn unmount_live_layers(rt: &runtime::Runtime) -> Result<()> {
+    let live_layers = rt.live_layers();
+    if !live_layers.is_empty() {
+        let spfs_config = crate::Config::current()?;
+        if spfs_config.filesystem.use_mount_syscalls {
+            unmount_live_layers_syscalls(live_layers)?;
+        } else {
+            unmount_live_layers_command(live_layers).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Unmount live layers using the "umount" command.
+async fn unmount_live_layers_command(live_layers: &Vec<runtime::LiveLayer>) -> Result<()> {
+    tracing::debug!(
+        "unmounting the extra bind mounts from the {SPFS_DIR} filesystem using the umount command ..."
+    );
+    let umount = super::resolve::which("umount").unwrap_or_else(|| "/usr/bin/umount".into());
+    for layer in live_layers {
+        let injection_mounts = layer.bind_mounts();
+        for extra_mount in injection_mounts {
+            let mut cmd = tokio::process::Command::new(umount.clone());
+            cmd.arg(PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone()));
+            tracing::debug!("About to run: {cmd:?}");
+            match cmd.status().await {
+                Err(err) => {
+                    return Err(Error::process_spawn_error("umount".to_owned(), err, None))
+                }
+                Ok(status) => match status.code() {
+                    Some(0) => (),
+                    _ => return Err(format!("Failed to unmount a bind mount injected into the {SPFS_DIR} filesystem using: {cmd:?}").into()),
+                },
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Unmount live layers using umount syscalls.
+fn unmount_live_layers_syscalls(live_layers: &Vec<runtime::LiveLayer>) -> Result<()> {
+    tracing::debug!(
+        "unmounting the extra bind mounts from the {SPFS_DIR} filesystem using syscalls ..."
+    );
+    for layer in live_layers {
+        let injection_mounts = layer.bind_mounts();
+        for extra_mount in injection_mounts {
+            let dest = if extra_mount.dest.starts_with(SPFS_DIR_PREFIX) {
+                PathBuf::from(extra_mount.dest.clone())
+            } else {
+                PathBuf::from(SPFS_DIR).join(extra_mount.dest.clone())
+            };
+            let flags = nix::mount::MntFlags::empty();
+            let result = nix::mount::umount2(&dest, flags);
+            if let Err(err) = result {
+                return Err(Error::wrap_nix(err, format!("Failed to unmount {dest:?}")));
+            }
+        }
+    }
 
     Ok(())
 }
